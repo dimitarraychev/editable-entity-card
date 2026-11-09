@@ -6,7 +6,7 @@
  */
 const TAG = "editable-entity-card";
 const EDITOR_TAG = "editable-entity-card-editor";
-const CARD_VERSION = "0.1.0-beta";
+const CARD_VERSION = "0.2.0-beta";
 
 const UNAVAILABLE = ["unavailable", "unknown"];
 const TEXT_DOMAINS = ["input_text", "text"];
@@ -25,6 +25,19 @@ const toRgb = (c) => {
   }
   const m = s.match(/^(?:rgb\()?\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)?$/i);
   return m ? `${m[1]},${m[2]},${m[3]}` : null;
+};
+// Any CSS color, [r, g, b], or a Home Assistant theme color name (blue, amber, primary…)
+const THEME_COLORS = [
+  "red", "pink", "purple", "deep-purple", "indigo", "blue", "light-blue", "cyan", "teal", "green", "light-green", "lime",
+  "yellow", "amber", "orange", "deep-orange", "brown", "light-grey", "grey", "dark-grey", "blue-grey", "black", "white", "disabled",
+];
+const cssColor = (c) => {
+  const rgb = toRgb(c);
+  if (rgb) return `rgb(${rgb})`;
+  if (typeof c !== "string" || !c.trim()) return null;
+  const s = c.trim();
+  if (s === "primary" || s === "accent" || THEME_COLORS.includes(s)) return `var(--${s}-color)`;
+  return s;
 };
 // white icon like your current card, dark only on near-white colors
 const iconColorFor = (rgb) => {
@@ -178,11 +191,21 @@ class EditableEntityCard extends HTMLElement {
     this._name.textContent = cfg.name ?? a.friendly_name ?? cfg.entity;
     this._icon.setAttribute("icon", cfg.icon || a.icon || "mdi:form-textbox");
 
-    // circle color: the value when it is a color, else `color`, else the theme color
+    // circle: background_color, else the value when it is a color, else the theme color
     const fromValue = cfg.color_from_value !== false && !unavailable ? toRgb(st.state) : null;
-    const rgb = fromValue || toRgb(cfg.color);
-    this._tile.style.background = rgb ? `rgb(${rgb})` : "var(--primary-color)";
-    this._tile.style.color = rgb ? iconColorFor(rgb) : "#fff";
+    let bg;
+    let bgRgb = null;
+    const explicit = cssColor(cfg.background_color);
+    const legacy = cssColor(cfg.color); // old option, still honoured
+    if (explicit) { bg = explicit; bgRgb = toRgb(cfg.background_color); }
+    else if (fromValue) { bg = `rgb(${fromValue})`; bgRgb = fromValue; }
+    else if (legacy) { bg = legacy; bgRgb = toRgb(cfg.color); }
+    else bg = "var(--primary-color)";
+    const o = cfg.background_opacity == null || isNaN(Number(cfg.background_opacity)) ? 1 : Math.min(1, Math.max(0, Number(cfg.background_opacity)));
+    // icon: icon_color, else the circle color on a see-through circle, else white (dark on near-white)
+    const icon = cssColor(cfg.icon_color) || (o < 1 ? bg : bgRgb ? iconColorFor(bgRgb) : "#fff");
+    this._tile.style.background = o < 1 ? `color-mix(in srgb, ${bg} ${Math.round(o * 100)}%, transparent)` : bg;
+    this._tile.style.color = icon;
     this._tile.style.opacity = unavailable ? ".5" : "1";
 
     this._input.disabled = unavailable;
@@ -201,20 +224,31 @@ const EDITOR_LABELS = {
   name: "Name",
   icon: "Icon",
   color_from_value: "Use the value as the circle color when it is a color",
-  color: "Circle color when the value is not a color (e.g. #2196f3)",
+  background_color: "Circle color (leave empty to follow the value or the theme color)",
+  background_opacity: "Circle opacity (1 = solid, 0.2 = soft like Mushroom)",
+  icon_color: "Icon color (leave empty for automatic)",
   placeholder: "Placeholder text",
 };
-const EDITOR_DEFAULTS = { color_from_value: true };
+const EDITOR_DEFAULTS = { color_from_value: true, background_opacity: 1 };
 const EDITOR_SCHEMA = [
   { name: "entity", required: true, selector: { entity: { domain: ["input_text", "text", "input_number", "number"] } } },
   { name: "name", selector: { text: {} } },
   { name: "icon", selector: { icon: {} } },
   { name: "color_from_value", selector: { boolean: {} } },
-  { name: "color", selector: { text: {} } },
+  { name: "background_color", selector: { color_rgb: {} } },
+  { name: "background_opacity", selector: { number: { min: 0, max: 1, step: 0.05, mode: "slider" } } },
+  { name: "icon_color", selector: { color_rgb: {} } },
   { name: "placeholder", selector: { text: {} } },
 ];
 
 class EditableEntityCardEditor extends HTMLElement {
+  _emit(config) {
+    const c = { ...config };
+    for (const [k, v] of Object.entries(EDITOR_DEFAULTS)) if (c[k] === v) delete c[k];
+    for (const k of Object.keys(c)) if (c[k] === "" || c[k] == null) delete c[k];
+    this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: c }, bubbles: true, composed: true }));
+  }
+
   setConfig(config) {
     this._config = config;
     this._sync();
@@ -234,15 +268,31 @@ class EditableEntityCardEditor extends HTMLElement {
       this._form.schema = EDITOR_SCHEMA;
       this._form.addEventListener("value-changed", (ev) => {
         ev.stopPropagation();
-        const config = { ...this._config, ...ev.detail.value };
-        for (const [k, v] of Object.entries(EDITOR_DEFAULTS)) if (config[k] === v) delete config[k];
-        for (const k of Object.keys(config)) if (config[k] === "" || config[k] == null) delete config[k];
-        this.dispatchEvent(new CustomEvent("config-changed", { detail: { config }, bubbles: true, composed: true }));
+        this._emit({ ...this._config, ...ev.detail.value });
       });
       this.appendChild(this._form);
+
+      // the color picker has no clear button, so offer resets
+      const style = document.createElement("style");
+      style.textContent = `.eec-resets { display: flex; gap: 16px; margin-top: 4px; }
+        .eec-reset { all: unset; cursor: pointer; font-size: 13px; color: var(--primary-color); }`;
+      this.appendChild(style);
+      this._resets = document.createElement("div");
+      this._resets.className = "eec-resets";
+      this.appendChild(this._resets);
     }
     this._form.hass = this._hass;
     this._form.data = { ...EDITOR_DEFAULTS, ...this._config };
+
+    this._resets.innerHTML = "";
+    [["background_color", "Reset circle color"], ["icon_color", "Reset icon color"]].forEach(([key, text]) => {
+      if (this._config[key] == null) return;
+      const b = document.createElement("button");
+      b.className = "eec-reset";
+      b.textContent = text;
+      b.addEventListener("click", () => { const c = { ...this._config }; delete c[key]; this._emit(c); });
+      this._resets.appendChild(b);
+    });
   }
 }
 
